@@ -60,20 +60,68 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
   end
 
   describe "#latest_resolvable_version" do
+    let(:latest_version) { Dependabot::Uv::Version.new("2.33.0") }
+    let(:latest_version_finder) do
+      instance_double(
+        Dependabot::Uv::UpdateChecker::LatestVersionFinder,
+        latest_version: latest_version
+      )
+    end
+
+    before do
+      allow(Dependabot::Uv::UpdateChecker::LatestVersionFinder)
+        .to receive(:new).and_return(latest_version_finder)
+    end
+
     context "when requirement is nil" do
       it "returns nil" do
         expect(resolver.latest_resolvable_version(requirement: nil)).to be_nil
       end
     end
 
-    context "when requirement is satisfied by the current version" do
-      it "returns the current version" do
+    context "when a newer version is resolvable" do
+      before do
+        lock_updater = instance_double(
+          Dependabot::Uv::FileUpdater::LockFileUpdater,
+          updated_dependency_files: []
+        )
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new).and_return(lock_updater)
+      end
+
+      it "returns the resolved newer version" do
+        result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
+        expect(result.to_s).to eq("2.33.0")
+      end
+    end
+
+    context "when the newer version is not resolvable" do
+      before do
+        lock_updater = instance_double(Dependabot::Uv::FileUpdater::LockFileUpdater)
+        allow(lock_updater).to receive(:updated_dependency_files)
+          .and_raise(Dependabot::DependencyFileNotResolvable, "cannot resolve")
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new).and_return(lock_updater)
+      end
+
+      it "falls back to the current version" do
+        result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
+        expect(result.to_s).to eq("2.32.3")
+      end
+    end
+
+    context "when the latest version is not newer than the current version" do
+      let(:latest_version) { Dependabot::Uv::Version.new("2.32.3") }
+
+      it "returns the current version when it satisfies the requirement" do
         result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
         expect(result.to_s).to eq("2.32.3")
       end
     end
 
     context "when requirement is not satisfied by the current version" do
+      let(:latest_version) { Dependabot::Uv::Version.new("2.32.3") }
+
       it "returns nil" do
         result = resolver.latest_resolvable_version(requirement: ">=3.0.0")
         expect(result).to be_nil

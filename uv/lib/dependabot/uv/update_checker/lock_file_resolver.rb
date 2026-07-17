@@ -3,11 +3,13 @@
 
 require "sorbet-runtime"
 
+require "dependabot/errors"
 require "dependabot/package/release_cooldown_options"
 require "dependabot/uv/version"
 require "dependabot/uv/requirement"
 require "dependabot/uv/update_checker"
 require "dependabot/uv/update_checker/latest_version_finder"
+require "dependabot/uv/file_updater/lock_file_updater"
 
 module Dependabot
   module Uv
@@ -49,12 +51,19 @@ module Dependabot
           return nil unless requirement
 
           req = Uv::Requirement.new(requirement)
+          current_version = dependency.version && Uv::Version.new(dependency.version)
 
-          # Get the version from the dependency if available
-          version_from_dependency = dependency.version && Uv::Version.new(dependency.version)
-          return version_from_dependency if version_from_dependency && req.satisfied_by?(version_from_dependency)
+          # Highest allowed version, honouring ignore conditions and the requirement upper bound.
+          target_version = highest_allowed_version(requirement: req)
 
-          nil
+          # Use it when it's newer than the current version and uv can resolve to it.
+          if target_version && (current_version.nil? || target_version > current_version) &&
+             resolvable_to?(target_version)
+            return target_version
+          end
+
+          # Otherwise report the current version when it still satisfies the requirement.
+          current_version if current_version && req.satisfied_by?(current_version)
         end
 
         sig { params(_version: T.anything).returns(T::Boolean) }
@@ -96,6 +105,42 @@ module Dependabot
 
         sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
         attr_reader :update_cooldown
+
+        # Highest version to resolve to, honouring ignore conditions and requirement upper bound.
+        sig { params(requirement: Dependabot::Uv::Requirement).returns(T.nilable(Dependabot::Uv::Version)) }
+        def highest_allowed_version(requirement:)
+          latest = latest_version_finder.latest_version
+          return nil unless latest
+
+          version = Uv::Version.new(latest.to_s)
+          return nil unless requirement.satisfied_by?(version)
+
+          version
+        end
+
+        # Runs the uv resolver to check whether the sub-dependency can be bumped to target_version.
+        sig { params(target_version: Dependabot::Uv::Version).returns(T::Boolean) }
+        def resolvable_to?(target_version)
+          updated_dependency = Dependabot::Dependency.new(
+            name: dependency.name,
+            version: target_version.to_s,
+            previous_version: dependency.version,
+            requirements: [],
+            previous_requirements: [],
+            package_manager: "uv"
+          )
+
+          FileUpdater::LockFileUpdater.new(
+            dependencies: [updated_dependency],
+            dependency_files: dependency_files,
+            credentials: credentials,
+            repo_contents_path: repo_contents_path
+          ).updated_dependency_files
+
+          true
+        rescue Dependabot::DependabotError, SharedHelpers::HelperSubprocessFailed
+          false
+        end
 
         sig { returns(LatestVersionFinder) }
         def latest_version_finder
