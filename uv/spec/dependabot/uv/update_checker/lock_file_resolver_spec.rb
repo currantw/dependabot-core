@@ -4,6 +4,7 @@
 require "spec_helper"
 require "dependabot/dependency"
 require "dependabot/dependency_file"
+require "dependabot/package/package_release"
 require "dependabot/package/release_cooldown_options"
 require "dependabot/security_advisory"
 require "dependabot/uv/update_checker/lock_file_resolver"
@@ -60,11 +61,16 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
   end
 
   describe "#latest_resolvable_version" do
-    let(:latest_version) { Dependabot::Uv::Version.new("2.33.0") }
+    let(:available_version_strings) { ["2.32.3", "2.33.0"] }
+    let(:available_versions) do
+      available_version_strings.map do |v|
+        Dependabot::Package::PackageRelease.new(version: Dependabot::Uv::Version.new(v))
+      end
+    end
     let(:latest_version_finder) do
       instance_double(
         Dependabot::Uv::UpdateChecker::LatestVersionFinder,
-        latest_version: latest_version
+        available_versions: available_versions
       )
     end
 
@@ -89,13 +95,71 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
           .to receive(:new).and_return(lock_updater)
       end
 
-      it "returns the resolved newer version" do
+      it "returns the highest resolvable version" do
         result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
         expect(result.to_s).to eq("2.33.0")
       end
     end
 
-    context "when the newer version is not resolvable" do
+    context "when the highest version conflicts but a lower one resolves" do
+      let(:available_version_strings) { ["2.32.3", "2.33.0", "2.34.0"] }
+
+      before do
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new) do |dependencies:, **_rest|
+            target = dependencies.first.version
+            raise Dependabot::DependencyFileNotResolvable, "conflict" if target == "2.34.0"
+
+            instance_double(
+              Dependabot::Uv::FileUpdater::LockFileUpdater,
+              updated_dependency_files: []
+            )
+          end
+      end
+
+      it "falls back to the next highest resolvable version" do
+        result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
+        expect(result.to_s).to eq("2.33.0")
+      end
+    end
+
+    context "when the requirement upper bound excludes the latest release" do
+      let(:available_version_strings) { ["2.32.3", "2.33.0", "3.0.0"] }
+
+      before do
+        lock_updater = instance_double(
+          Dependabot::Uv::FileUpdater::LockFileUpdater,
+          updated_dependency_files: []
+        )
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new).and_return(lock_updater)
+      end
+
+      it "returns the highest version within the requirement" do
+        result = resolver.latest_resolvable_version(requirement: ">=2.30.0,<3")
+        expect(result.to_s).to eq("2.33.0")
+      end
+    end
+
+    context "when ignore conditions exclude the newer version" do
+      let(:ignored_versions) { [">= 2.33.0"] }
+
+      before do
+        lock_updater = instance_double(
+          Dependabot::Uv::FileUpdater::LockFileUpdater,
+          updated_dependency_files: []
+        )
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new).and_return(lock_updater)
+      end
+
+      it "falls back to the current version" do
+        result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
+        expect(result.to_s).to eq("2.32.3")
+      end
+    end
+
+    context "when no newer version is resolvable" do
       before do
         lock_updater = instance_double(Dependabot::Uv::FileUpdater::LockFileUpdater)
         allow(lock_updater).to receive(:updated_dependency_files)
@@ -110,8 +174,23 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
       end
     end
 
-    context "when the latest version is not newer than the current version" do
-      let(:latest_version) { Dependabot::Uv::Version.new("2.32.3") }
+    context "when an operational error occurs during resolution" do
+      before do
+        lock_updater = instance_double(Dependabot::Uv::FileUpdater::LockFileUpdater)
+        allow(lock_updater).to receive(:updated_dependency_files)
+          .and_raise(Dependabot::PrivateSourceAuthenticationFailure, "pypi.example.com")
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new).and_return(lock_updater)
+      end
+
+      it "propagates the error instead of silently reporting no update" do
+        expect { resolver.latest_resolvable_version(requirement: ">=2.30.0") }
+          .to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
+      end
+    end
+
+    context "when there are no newer versions available" do
+      let(:available_version_strings) { ["2.31.0", "2.32.3"] }
 
       it "returns the current version when it satisfies the requirement" do
         result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
@@ -120,7 +199,7 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
     end
 
     context "when requirement is not satisfied by the current version" do
-      let(:latest_version) { Dependabot::Uv::Version.new("2.32.3") }
+      let(:available_version_strings) { ["2.32.3"] }
 
       it "returns nil" do
         result = resolver.latest_resolvable_version(requirement: ">=3.0.0")

@@ -53,13 +53,10 @@ module Dependabot
           req = Uv::Requirement.new(requirement)
           current_version = dependency.version && Uv::Version.new(dependency.version)
 
-          # Highest allowed version, honouring ignore conditions and the requirement upper bound.
-          target_version = highest_allowed_version(requirement: req)
-
-          # Use it when it's newer than the current version and uv can resolve to it.
-          if target_version && (current_version.nil? || target_version > current_version) &&
-             resolvable_to?(target_version)
-            return target_version
+          # Probe allowed candidate versions from highest to lowest, returning the
+          # first one uv can actually resolve to.
+          candidate_versions(req, current_version).each do |candidate|
+            return candidate if resolvable_to?(candidate)
           end
 
           # Otherwise report the current version when it still satisfies the requirement.
@@ -106,16 +103,45 @@ module Dependabot
         sig { returns(T.nilable(Dependabot::Package::ReleaseCooldownOptions)) }
         attr_reader :update_cooldown
 
-        # Highest version to resolve to, honouring ignore conditions and requirement upper bound.
-        sig { params(requirement: Dependabot::Uv::Requirement).returns(T.nilable(Dependabot::Uv::Version)) }
-        def highest_allowed_version(requirement:)
-          latest = latest_version_finder.latest_version
-          return nil unless latest
+        # Allowed candidate versions (newer than current, satisfying the requirement and
+        # not ignored), highest first, so uv can be probed for the best resolvable one.
+        sig do
+          params(
+            requirement: Dependabot::Uv::Requirement,
+            current_version: T.nilable(Dependabot::Uv::Version)
+          ).returns(T::Array[Dependabot::Uv::Version])
+        end
+        def candidate_versions(requirement, current_version)
+          releases = latest_version_finder.available_versions || []
 
-          version = Uv::Version.new(latest.to_s)
-          return nil unless requirement.satisfied_by?(version)
+          releases
+            .map { |release| Uv::Version.new(release.version.to_s) }
+            .uniq
+            .select { |version| candidate?(version, requirement, current_version) }
+            .sort
+            .reverse
+        end
 
-          version
+        sig do
+          params(
+            version: Dependabot::Uv::Version,
+            requirement: Dependabot::Uv::Requirement,
+            current_version: T.nilable(Dependabot::Uv::Version)
+          ).returns(T::Boolean)
+        end
+        def candidate?(version, requirement, current_version)
+          return false unless requirement.satisfied_by?(version)
+          return false if current_version && version <= current_version
+          return false if version.prerelease? && !current_version&.prerelease?
+          return false if ignored?(version)
+
+          true
+        end
+
+        sig { params(version: Dependabot::Uv::Version).returns(T::Boolean) }
+        def ignored?(version)
+          ignored_versions.flat_map { |req| Uv::Requirement.requirements_array(req) }
+                          .any? { |r| r.satisfied_by?(version) }
         end
 
         # Runs the uv resolver to check whether the sub-dependency can be bumped to target_version.
@@ -138,7 +164,9 @@ module Dependabot
           ).updated_dependency_files
 
           true
-        rescue Dependabot::DependabotError, SharedHelpers::HelperSubprocessFailed
+        rescue Dependabot::DependencyFileNotResolvable, Dependabot::UpdateNotPossible
+          # Genuine version-solving incompatibility: the dependency can't be bumped to
+          # this version. Operational errors (auth, tooling, network, etc.) propagate.
           false
         end
 
