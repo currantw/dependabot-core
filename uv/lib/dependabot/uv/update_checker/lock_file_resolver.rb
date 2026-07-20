@@ -17,6 +17,16 @@ module Dependabot
       class LockFileResolver
         extend T::Sig
 
+        # Markers in a uv error that indicate a genuine version-solving conflict for the
+        # probed candidate (as opposed to workspace/build/tooling failures).
+        RESOLUTION_CONFLICT_MARKERS = T.let(
+          Regexp.union(
+            "No solution found when resolving dependencies",
+            "ResolutionImpossible"
+          ),
+          Regexp
+        )
+
         sig do
           params(
             dependency: Dependabot::Dependency,
@@ -164,9 +174,14 @@ module Dependabot
           ).updated_dependency_files
 
           true
-        rescue Dependabot::DependencyFileNotResolvable, Dependabot::UpdateNotPossible
-          # Genuine version-solving incompatibility: the dependency can't be bumped to
-          # this version. Operational errors (auth, tooling, network, etc.) propagate.
+        rescue Dependabot::UpdateNotPossible
+          # uv extracted a concrete version conflict for this candidate: not resolvable.
+          false
+        rescue Dependabot::DependencyFileNotResolvable => e
+          # Only a genuine resolver conflict means this candidate is unresolvable; other
+          # failures (workspace, build, network, tooling, etc.) must propagate.
+          raise unless e.message.match?(RESOLUTION_CONFLICT_MARKERS)
+
           false
         end
 

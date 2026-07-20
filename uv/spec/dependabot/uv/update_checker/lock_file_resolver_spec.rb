@@ -108,7 +108,10 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
         allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
           .to receive(:new) do |dependencies:, **_rest|
             target = dependencies.first.version
-            raise Dependabot::DependencyFileNotResolvable, "conflict" if target == "2.34.0"
+            if target == "2.34.0"
+              raise Dependabot::DependencyFileNotResolvable,
+                    "No solution found when resolving dependencies"
+            end
 
             instance_double(
               Dependabot::Uv::FileUpdater::LockFileUpdater,
@@ -163,7 +166,7 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
       before do
         lock_updater = instance_double(Dependabot::Uv::FileUpdater::LockFileUpdater)
         allow(lock_updater).to receive(:updated_dependency_files)
-          .and_raise(Dependabot::DependencyFileNotResolvable, "cannot resolve")
+          .and_raise(Dependabot::DependencyFileNotResolvable, "No solution found when resolving dependencies")
         allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
           .to receive(:new).and_return(lock_updater)
       end
@@ -171,6 +174,21 @@ RSpec.describe Dependabot::Uv::UpdateChecker::LockFileResolver do
       it "falls back to the current version" do
         result = resolver.latest_resolvable_version(requirement: ">=2.30.0")
         expect(result.to_s).to eq("2.32.3")
+      end
+    end
+
+    context "when a non-conflict resolution error occurs" do
+      before do
+        lock_updater = instance_double(Dependabot::Uv::FileUpdater::LockFileUpdater)
+        allow(lock_updater).to receive(:updated_dependency_files)
+          .and_raise(Dependabot::DependencyFileNotResolvable, "Failed to find workspace member")
+        allow(Dependabot::Uv::FileUpdater::LockFileUpdater)
+          .to receive(:new).and_return(lock_updater)
+      end
+
+      it "propagates the error instead of silently reporting no update" do
+        expect { resolver.latest_resolvable_version(requirement: ">=2.30.0") }
+          .to raise_error(Dependabot::DependencyFileNotResolvable, /workspace member/)
       end
     end
 
